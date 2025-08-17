@@ -284,90 +284,32 @@ impl<'pass, 'frame: 'pass, 'global: 'frame> CommandRenderer<'pass, 'frame, 'glob
                 .push_debug_group(&format!("render_bitmap_scale9grid {:?}", bitmap.0));
         }
 
-        // Create a 9-slice scaling mesh
-        let texture = as_texture(bitmap);
-        
-        // Calculate the 9-slice grid dimensions
-        let [x_min, x_max, y_min, y_max] = scale9_rect;
-        let src_width = src_size[0];
-        let src_height = src_size[1];
-        let dst_width = dst_size[0];
-        let dst_height = dst_size[1];
-        
-        println!("   Grid dimensions: x_min={}, x_max={}, y_min={}, y_max={}", x_min, x_max, y_min, y_max);
-        println!("   Source: {}x{}, Destination: {}x{}", src_width, src_height, dst_width, dst_height);
-        
-        // Create vertices for 9-slice grid (3x3 quads)
+        // Create vertices for a single quad that covers the entire destination area
+        // The shader will handle the 9-slice logic by calculating the correct UV coordinates
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
         
-        // Define the 9 regions with proper source and destination coordinates
-        // Each region is defined as: (src_x1, src_y1, src_x2, src_y2, dst_x1, dst_y1, dst_x2, dst_y2)
-        // The key insight: corners don't scale, edges scale in one direction, center scales in both directions
+        // Get the texture from the bitmap
+        let texture = as_texture(bitmap);
         
-        // Calculate the actual destination dimensions based on the transform
-        let actual_dst_width = dst_width;
-        let actual_dst_height = dst_height;
+        // Single quad covering the entire destination area
+        // UV coordinates will be calculated by the shader based on scale9_rect
+        vertices.extend_from_slice(&[
+            // Top-left: position (0,0), UV will be calculated by shader
+            [0.0, 0.0, 0.0, 0.0],
+            // Top-right: position (dst_width,0), UV will be calculated by shader  
+            [dst_size[0], 0.0, 1.0, 0.0],
+            // Bottom-right: position (dst_width,dst_height), UV will be calculated by shader
+            [dst_size[0], dst_size[1], 1.0, 1.0],
+            // Bottom-left: position (0,dst_height), UV will be calculated by shader
+            [0.0, dst_size[1], 0.0, 1.0],
+        ]);
         
-        // Calculate the preserved corner sizes (these don't scale)
-        let left_corner_width = x_min;
-        let right_corner_width = src_width - x_max;
-        let top_corner_height = y_min;
-        let bottom_corner_height = src_height - y_max;
+        // 6 indices for 2 triangles
+        indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
         
-        // Calculate the scaled middle region dimensions
-        let middle_width = actual_dst_width - left_corner_width - right_corner_width;
-        let middle_height = actual_dst_height - top_corner_height - bottom_corner_height;
-        
-        let regions = [
-            // Top-left corner (no scaling)
-            (0.0, 0.0, x_min, y_min, 0.0, 0.0, left_corner_width, top_corner_height),
-            // Top edge (horizontal scaling only)
-            (x_min, 0.0, x_max, y_min, left_corner_width, 0.0, left_corner_width + middle_width, top_corner_height),
-            // Top-right corner (no scaling)
-            (x_max, 0.0, src_width, y_min, left_corner_width + middle_width, 0.0, actual_dst_width, top_corner_height),
-            // Left edge (vertical scaling only)
-            (0.0, y_min, x_min, y_max, 0.0, top_corner_height, left_corner_width, top_corner_height + middle_height),
-            // Center (scales in both directions)
-            (x_min, y_min, x_max, y_max, left_corner_width, top_corner_height, left_corner_width + middle_width, top_corner_height + middle_height),
-            // Right edge (vertical scaling only)
-            (x_max, y_min, src_width, y_max, left_corner_width + middle_width, top_corner_height, actual_dst_width, top_corner_height + middle_height),
-            // Bottom-left corner (no scaling)
-            (0.0, y_max, x_min, src_height, 0.0, top_corner_height + middle_height, left_corner_width, actual_dst_height),
-            // Bottom edge (horizontal scaling only)
-            (x_min, y_max, x_max, src_height, left_corner_width, top_corner_height + middle_height, left_corner_width + middle_width, actual_dst_height),
-            // Bottom-right corner (no scaling)
-            (x_max, y_max, src_width, src_height, left_corner_width + middle_width, top_corner_height + middle_height, actual_dst_width, actual_dst_height),
-        ];
-        
-        let mut vertex_index = 0;
-        for (sx1, sy1, sx2, sy2, dx1, dy1, dx2, dy2) in regions.iter() {
-            println!("   Region: src=({:.1},{:.1}) to ({:.1},{:.1}), dst=({:.1},{:.1}) to ({:.1},{:.1})", 
-                sx1, sy1, sx2, sy2, dx1, dy1, dx2, dy2);
-            
-            // Add 4 vertices for this quad
-            // UV coordinates should be normalized texture coordinates (0.0 to 1.0)
-            vertices.extend_from_slice(&[
-                // Top-left
-                [*dx1, *dy1, *sx1 / 200.0, *sy1 / 200.0],  // Fixed: use actual source texture size
-                // Top-right  
-                [*dx2, *dy1, *sx2 / 200.0, *sy1 / 200.0],  // Fixed: use actual source texture size
-                // Bottom-right
-                [*dx2, *dy2, *sx2 / 200.0, *sy2 / 200.0],  // Fixed: use actual source texture size
-                // Bottom-left
-                [*dx1, *dy2, *sx1 / 200.0, *sy2 / 200.0],  // Fixed: use actual source texture size
-            ]);
-            
-            // Add 6 indices for this quad (2 triangles)
-            indices.extend_from_slice(&[
-                vertex_index, vertex_index + 1, vertex_index + 2,
-                vertex_index, vertex_index + 2, vertex_index + 3,
-            ]);
-            
-            vertex_index += 4;
-        }
-        
-        println!("   Generated {} vertices and {} indices", vertices.len(), indices.len());
+        println!("   Generated single quad with 4 vertices and 6 indices");
+        println!("   Destination area: {}x{}", dst_size[0], dst_size[1]);
         
         // Create vertex and index buffers
         let vertex_buffer = self.descriptors.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
