@@ -56,7 +56,14 @@ mod surface;
 impl BitmapHandleImpl for Texture {}
 
 pub fn as_texture(handle: &BitmapHandle) -> &Texture {
-    <dyn Any>::downcast_ref(&*handle.0).unwrap()
+    // Check if this is a Scale9Grid bitmap
+    if let Some(scale9grid) = ruffle_render::bitmap::as_scale9grid_bitmap(handle) {
+        // Get the texture directly from the underlying bitmap implementation
+        <dyn Any>::downcast_ref::<Texture>(&*scale9grid.bitmap).unwrap()
+    } else {
+        // Regular bitmap, try to downcast to Texture
+        <dyn Any>::downcast_ref(&*handle.0).unwrap()
+    }
 }
 
 pub fn raw_texture_as_texture(handle: &dyn RawTexture) -> &wgpu::Texture {

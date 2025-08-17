@@ -757,7 +757,11 @@ impl<'gc> DisplayObjectBase<'gc> {
 
     fn recheck_cache_as_bitmap(&self) {
         let mut write = self.cell.borrow_mut();
-        let should_cache = self.is_bitmap_cached_preference() || !write.filters.is_empty();
+        let scale9grid = self.scaling_grid.get();
+        let should_cache = self.is_bitmap_cached_preference() 
+            || !write.filters.is_empty()
+            || (scale9grid.width() > Twips::ZERO && scale9grid.height() > Twips::ZERO);
+        
         if should_cache && write.cache.is_none() {
             write.cache = Some(Default::default());
         } else if !should_cache && write.cache.is_some() {
@@ -970,20 +974,87 @@ pub fn render_base<'gc>(this: DisplayObject<'gc>, context: &mut RenderContext<'_
 
         // When rendering it back, ensure we're only keeping the translation - scale/rotation is within the image already
         apply_standard_mask_and_scroll(this, context, |context| {
-            context.commands.render_bitmap(
-                cache_info.handle,
-                Transform {
-                    matrix: Matrix {
-                        tx: context.transform_stack.transform().matrix.tx + offset_x,
-                        ty: context.transform_stack.transform().matrix.ty + offset_y,
-                        ..Default::default()
+            // Check if we should use 9-slice scaling
+            let scaling_grid = this.scaling_grid();
+            
+            // Only apply 9-slice scaling if this object has it AND no children have scale9grid
+            // This ensures only the innermost object with scale9grid applies it
+            let should_use_scale9 = scaling_grid.width() > Twips::ZERO 
+                && scaling_grid.height() > Twips::ZERO
+                && !this.has_child_with_scale9grid();
+            
+            // Check if there's any rotation applied to the transform
+            let transform_matrix = context.transform_stack.transform().matrix;
+            let has_rotation = transform_matrix.b.abs() != 0.0 || transform_matrix.c.abs() != 0.0;
+            
+            // Disable Scale9Grid when rotation is applied
+            let should_use_scale9 = should_use_scale9 && !has_rotation;
+            
+            if should_use_scale9 {
+                let src_width = cache_info.bounds.width().to_pixels() as f32;
+                let src_height = cache_info.bounds.height().to_pixels() as f32;
+                let dst_width = (cache_info.bounds.width().to_pixels() as f32) * context.transform_stack.transform().matrix.a;
+                let dst_height = (cache_info.bounds.height().to_pixels() as f32) * context.transform_stack.transform().matrix.d;
+                
+                // The scaling_grid defines the CENTER region of the 9-slice grid
+                // Rectangle(x, y, width, height) where (x,y) is the top-left position relative to object center
+                let object_width = this.width() as f32;
+                let object_height = this.height() as f32;
+                
+                // Convert from object-local coordinates (centered) to bitmap coordinates (top-left)
+                // The Rectangle position is relative to object center, so we add object_width/2 and object_height/2
+                let center_x = scaling_grid.x_min.to_pixels() as f32 + object_width / 2.0;
+                let center_y = scaling_grid.y_min.to_pixels() as f32 + object_height / 2.0;
+                let center_width = scaling_grid.width().to_pixels() as f32;
+                let center_height = scaling_grid.height().to_pixels() as f32;
+                
+                // The scale9_rect defines the center region boundaries
+                let scale9_rect = [
+                    center_x.max(0.0),                    // x_min (left edge of center)
+                    (center_x + center_width).min(object_width), // x_max (right edge of center)
+                    center_y.max(0.0),                    // y_min (top edge of center)
+                    (center_y + center_height).min(object_height), // y_max (bottom edge of center)
+                ];
+                
+                // Create a bitmap handle with Scale9Grid parameters
+                let scale9grid_handle = BitmapHandle::with_scale9_grid(
+                    cache_info.handle.0.clone(),
+                    Some(scale9_rect),
+                    Some([src_width, src_height]),
+                    Some([dst_width, dst_height]),
+                );
+                
+                context.commands.render_bitmap(
+                    scale9grid_handle,
+                    Transform {
+                        matrix: Matrix {
+                            tx: context.transform_stack.transform().matrix.tx + offset_x,
+                            ty: context.transform_stack.transform().matrix.ty + offset_y,
+                            ..Default::default()
+                        },
+                        color_transform: cache_info.base_transform.color_transform,
+                        perspective_projection: cache_info.base_transform.perspective_projection,
                     },
-                    color_transform: cache_info.base_transform.color_transform,
-                    perspective_projection: cache_info.base_transform.perspective_projection,
-                },
-                true,
-                PixelSnapping::Always, // cacheAsBitmap forces pixel snapping
-            )
+                    true, // smoothing
+                    PixelSnapping::Always, // cacheAsBitmap forces pixel snapping
+                );
+            } else {
+                // Use normal bitmap rendering
+                context.commands.render_bitmap(
+                    cache_info.handle,
+                    Transform {
+                        matrix: Matrix {
+                            tx: context.transform_stack.transform().matrix.tx + offset_x,
+                            ty: context.transform_stack.transform().matrix.ty + offset_y,
+                            ..Default::default()
+                        },
+                        color_transform: cache_info.base_transform.color_transform,
+                        perspective_projection: cache_info.base_transform.perspective_projection,
+                    },
+                    true,
+                    PixelSnapping::Always, // cacheAsBitmap forces pixel snapping
+                );
+            }
         });
     } else {
         if let Some(background) = this.opaque_background() {
@@ -1803,6 +1874,28 @@ pub trait TDisplayObject<'gc>:
     #[no_dynamic]
     fn set_scaling_grid(self, rect: Rectangle<Twips>) {
         self.base().scaling_grid.set(rect);
+        // After setting the scaling_grid, we need to recheck if we should cache as bitmap
+        self.base().recheck_cache_as_bitmap();
+    }
+
+    /// Returns true if any child of this display object has a scale9grid set.
+    /// This is used to determine if 9-slice scaling should be applied to the parent
+    /// when cacheAsBitmap is enabled.
+    #[no_dynamic]
+    fn has_child_with_scale9grid(self) -> bool {
+        if let Some(container) = self.as_container() {
+            for child in container.iter_render_list() {
+                let child_grid = child.scaling_grid();
+                if child_grid.width() > Twips::ZERO && child_grid.height() > Twips::ZERO {
+                    return true;
+                }
+                // Recursively check children
+                if child.has_child_with_scale9grid() {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     #[no_dynamic]
@@ -1896,7 +1989,6 @@ pub trait TDisplayObject<'gc>:
     #[no_dynamic]
     fn set_blend_shader(self, value: Option<PixelBenderShaderHandle>) {
         self.base().set_blend_shader(value);
-        self.set_blend_mode(ExtendedBlendMode::Shader);
     }
 
     #[no_dynamic]

@@ -9,8 +9,37 @@ use swf::{Rectangle, Twips};
 use crate::backend::RenderBackend;
 use crate::matrix::Matrix;
 
+/// A handle to a bitmap that can be used for rendering.
+/// The actual bitmap data is stored in the render backend.
 #[derive(Clone, Debug)]
 pub struct BitmapHandle(pub Arc<dyn BitmapHandleImpl>);
+
+impl BitmapHandle {
+    /// Create a new bitmap handle with optional Scale9Grid parameters
+    pub fn with_scale9_grid(
+        bitmap: Arc<dyn BitmapHandleImpl>,
+        scale9_rect: Option<[f32; 4]>,
+        src_size: Option<[f32; 2]>,
+        dst_size: Option<[f32; 2]>,
+    ) -> Self {
+        if let (Some(rect), Some(src), Some(dst)) = (scale9_rect, src_size, dst_size) {
+            // Create a Scale9GridBitmap that wraps the original bitmap
+            let scale9grid = Scale9GridBitmap::new(bitmap, rect, src, dst);
+            Self(Arc::new(scale9grid))
+        } else {
+            Self(bitmap)
+        }
+    }
+
+    /// Get Scale9Grid parameters if this bitmap has them
+    pub fn get_scale9_grid(&self) -> Option<(&[f32; 4], &[f32; 2], &[f32; 2])> {
+        if let Some(scale9grid) = as_scale9grid_bitmap(self) {
+            Some((&scale9grid.scale9_rect, &scale9grid.src_size, &scale9grid.dst_size))
+        } else {
+            None
+        }
+    }
+}
 
 impl PartialEq for BitmapHandle {
     fn eq(&self, other: &Self) -> bool {
@@ -19,6 +48,48 @@ impl PartialEq for BitmapHandle {
 }
 
 pub trait BitmapHandleImpl: Any + Debug {}
+
+/// A bitmap handle that applies Scale9Grid scaling
+#[derive(Clone, Debug)]
+pub struct Scale9GridBitmap {
+    /// The underlying bitmap implementation
+    pub bitmap: Arc<dyn BitmapHandleImpl>,
+    /// The 9-slice grid rectangle in source texture space: [x_min, x_max, y_min, y_max]
+    pub scale9_rect: [f32; 4],
+    /// The source texture dimensions
+    pub src_size: [f32; 2],
+    /// The destination dimensions for scaling
+    pub dst_size: [f32; 2],
+}
+
+impl BitmapHandleImpl for Scale9GridBitmap {}
+
+impl Scale9GridBitmap {
+    /// Create a new Scale9GridBitmap from a bitmap implementation
+    pub fn new(
+        bitmap: Arc<dyn BitmapHandleImpl>,
+        scale9_rect: [f32; 4],
+        src_size: [f32; 2],
+        dst_size: [f32; 2],
+    ) -> Self {
+        Self {
+            bitmap,
+            scale9_rect,
+            src_size,
+            dst_size,
+        }
+    }
+}
+
+/// Check if a bitmap handle is a Scale9Grid bitmap
+pub fn is_scale9grid_bitmap(handle: &BitmapHandle) -> bool {
+    <dyn Any>::downcast_ref::<Scale9GridBitmap>(&*handle.0).is_some()
+}
+
+/// Try to get Scale9Grid parameters from a bitmap handle
+pub fn as_scale9grid_bitmap(handle: &BitmapHandle) -> Option<&Scale9GridBitmap> {
+    <dyn Any>::downcast_ref::<Scale9GridBitmap>(&*handle.0)
+}
 
 /// Info returned by the `register_bitmap` methods.
 #[derive(Clone, Debug)]

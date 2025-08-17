@@ -36,5 +36,10 @@ fn main_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
             color = saturate(color);
         }
     }
+    
+    // DEBUG: Add a subtle blue tint to regular bitmap rendering to distinguish it
+    let debug_tint = vec4<f32>(0.0, 0.0, 0.1, 0.0);
+    color = color + debug_tint;
+    
     return color;
 }

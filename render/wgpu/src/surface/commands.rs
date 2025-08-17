@@ -19,6 +19,8 @@ use ruffle_render::transform::Transform;
 use std::mem;
 use swf::{BlendMode, Color, ColorTransform, Twips};
 use wgpu::Backend;
+use wgpu::util::DeviceExt;
+use bytemuck;
 
 use super::target::PoolOrArcTexture;
 
@@ -166,6 +168,8 @@ impl<'pass, 'frame: 'pass, 'global: 'frame> CommandRenderer<'pass, 'frame, 'glob
         self.render_pass.set_bind_group(2, bind_group, &[]);
     }
 
+
+
     pub fn draw(
         &mut self,
         vertices: wgpu::BufferSlice<'pass>,
@@ -191,6 +195,30 @@ impl<'pass, 'frame: 'pass, 'global: 'frame> CommandRenderer<'pass, 'frame, 'glob
             self.render_pass
                 .push_debug_group(&format!("render_bitmap {:?}", bitmap.0));
         }
+
+        // Check if this bitmap has Scale9Grid parameters
+        if let Some((scale9_rect, src_size, dst_size)) = bitmap.get_scale9_grid() {
+            // DEBUG: Add immediate debug output
+            println!("🎯 Scale9Grid detected in render_bitmap!");
+            tracing::info!("🎯 Scale9Grid detected in render_bitmap!");
+            
+            // Call the Scale9Grid rendering function directly
+            self.render_bitmap_scale9grid_internal(
+                bitmap,
+                transform_buffer,
+                smoothing,
+                *scale9_rect,
+                *src_size,
+                *dst_size,
+            );
+            return;
+        } else {
+            // DEBUG: Add debug output when Scale9Grid is NOT detected
+            println!("❌ Scale9Grid NOT detected in render_bitmap");
+            tracing::info!("❌ Scale9Grid NOT detected in render_bitmap");
+        }
+
+        // Regular bitmap rendering
         let texture = as_texture(bitmap);
 
         let descriptors = self.descriptors;
@@ -246,6 +274,92 @@ impl<'pass, 'frame: 'pass, 'global: 'frame> CommandRenderer<'pass, 'frame, 'glob
         }
     }
 
+    pub fn render_bitmap_scale9grid_internal(
+        &mut self,
+        bitmap: &'frame BitmapHandle,
+        transform_buffer: wgpu::DynamicOffset,
+        smoothing: bool,
+        scale9_rect: [f32; 4],
+        src_size: [f32; 2],
+        dst_size: [f32; 2],
+    ) {
+        // DEBUG: Add immediate debug output
+        println!("🎯 Scale9Grid rendering function called!");
+        tracing::info!("🎯 Scale9Grid rendering function called!");
+        
+        if cfg!(feature = "render_debug_labels") {
+            self.render_pass
+                .push_debug_group(&format!("render_bitmap_scale9grid {:?}", bitmap.0));
+        }
+
+        // Get the texture from the bitmap handle
+        let texture = as_texture(bitmap);
+        
+        // DEBUG: Log the Scale9Grid parameters
+        println!("Scale9Grid params: rect={:?}, src={:?}, dst={:?}", scale9_rect, src_size, dst_size);
+        tracing::debug!(
+            "Scale9Grid params: rect={:?}, src={:?}, dst={:?}",
+            scale9_rect, src_size, dst_size
+        );
+        
+        // Create bind group for the texture
+        let bind = texture.bind_group(
+            smoothing,
+            &self.descriptors.device,
+            &self.descriptors.bind_layouts.bitmap,
+            &self.descriptors.quad,
+            bitmap.clone(),
+            &self.descriptors.bitmap_samplers,
+        );
+        
+        // Create bind group for scale9grid parameters
+        let scale9_params = crate::mesh::Scale9Params {
+            scale9_rect,
+            src_size,
+            dst_size,
+        };
+        
+        let scale9_buffer = self.descriptors.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Scale9Grid params"),
+            contents: bytemuck::cast_slice(&[scale9_params]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        
+        let scale9_bind_group = self.descriptors.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Scale9Grid bind group"),
+            layout: &self.descriptors.bind_layouts.scale9grid,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: scale9_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        
+        // Set up the render pass
+        if self.needs_stencil {
+            self.render_pass
+                .set_pipeline(self.pipelines.scale9grid.pipeline_for(self.mask_state));
+        } else {
+            self.render_pass
+                .set_pipeline(self.pipelines.scale9grid.stencilless_pipeline());
+        }
+        
+        // Set bind groups (group 0 is already set by the surface)
+        self.render_pass.set_bind_group(1, &self.dynamic_transforms.bind_group, &[transform_buffer]);
+        self.render_pass.set_bind_group(2, &bind.bind_group, &[]);
+        self.render_pass.set_bind_group(3, &scale9_bind_group, &[]);
+        
+        // Use the standard quad
+        self.render_pass.set_vertex_buffer(0, self.descriptors.quad.vertices_pos.slice(..));
+        self.render_pass.set_index_buffer(self.descriptors.quad.indices.slice(..), wgpu::IndexFormat::Uint32);
+        self.render_pass.draw_indexed(0..6, 0, 0..1);
+        
+        if cfg!(feature = "render_debug_labels") {
+            self.render_pass.pop_debug_group();
+        }
+    }
+
     pub fn render_shape(
         &mut self,
         shape: &'frame ShapeHandle,
@@ -279,6 +393,7 @@ impl<'pass, 'frame: 'pass, 'global: 'frame> CommandRenderer<'pass, 'frame, 'glob
                 DrawType::Bitmap { binds, .. } => {
                     self.prep_bitmap(&binds.bind_group, TrivialBlend::Normal, false);
                 }
+
             }
             self.render_pass.set_bind_group(
                 1,
@@ -718,6 +833,30 @@ impl CommandHandler for WgpuCommandHandler<'_> {
         pixel_snapping: PixelSnapping,
     ) {
         let mut matrix = transform.matrix;
+        
+        // Check if this bitmap has Scale9Grid parameters
+        if let Some((_scale9_rect, _src_size, dst_size)) = bitmap.get_scale9_grid() {
+            // Use Scale9Grid rendering (rotation check already done in display object)
+            
+            // For Scale9Grid, we need to handle the rendering differently
+            // We'll use the destination size for scaling instead of the texture size
+            pixel_snapping.apply(&mut matrix);
+            matrix *= Matrix::scale(dst_size[0], dst_size[1]);
+            
+            // Add to current with Scale9Grid parameters
+            self.add_to_current(matrix, transform.color_transform, |transform_buffer| {
+                DrawCommand::RenderBitmap {
+                    bitmap,
+                    transform_buffer,
+                    smoothing,
+                    blend_mode: TrivialBlend::Normal,
+                    render_stage3d: false,
+                }
+            });
+            return;
+        }
+        
+        // Regular bitmap rendering (no Scale9Grid)
         {
             let texture = as_texture(&bitmap);
             pixel_snapping.apply(&mut matrix);
@@ -736,6 +875,7 @@ impl CommandHandler for WgpuCommandHandler<'_> {
             }
         });
     }
+
     fn render_stage3d(&mut self, bitmap: BitmapHandle, transform: Transform) {
         let mut matrix = transform.matrix;
         {

@@ -66,10 +66,10 @@ impl CommandList {
                     smoothing,
                     pixel_snapping,
                 } => handler.render_bitmap(bitmap, transform, smoothing, pixel_snapping),
-                Command::RenderShape { shape, transform } => handler.render_shape(shape, transform),
                 Command::RenderStage3D { bitmap, transform } => {
                     handler.render_stage3d(bitmap, transform)
                 }
+                Command::RenderShape { shape, transform } => handler.render_shape(shape, transform),
                 Command::DrawRect { color, matrix } => handler.draw_rect(color, matrix),
                 Command::DrawLine { color, matrix } => handler.draw_line(color, matrix),
                 Command::DrawLineRect { color, matrix } => handler.draw_line_rect(color, matrix),
