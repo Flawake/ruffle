@@ -6,6 +6,7 @@ use crate::{
 use std::any::Any;
 use std::ops::Range;
 use wgpu::util::DeviceExt;
+use bytemuck;
 
 use crate::buffer_builder::BufferBuilder;
 use ruffle_render::backend::{RenderBackend, ShapeHandle, ShapeHandleImpl};
@@ -15,6 +16,14 @@ use swf::{CharacterId, GradientInterpolation};
 
 /// How big to make gradient textures. Larger will keep more detail, but be slower and use more memory.
 const GRADIENT_SIZE: usize = 256;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Scale9Params {
+    pub scale9_rect: [f32; 4], // x_min, x_max, y_min, y_max in source texture space
+    pub src_size: [f32; 2],
+    pub dst_size: [f32; 2],
+}
 
 #[derive(Debug)]
 pub struct Mesh {
@@ -133,6 +142,7 @@ pub enum PendingDrawType {
         is_smoothed: bool,
         bind_group_label: Option<String>,
     },
+
 }
 
 /// Converts an RGBA color from sRGB space to linear color space.
@@ -194,6 +204,8 @@ impl PendingDrawType {
             bind_group_label,
         })
     }
+
+
 
     pub fn finish(
         self,
@@ -270,6 +282,7 @@ impl PendingDrawType {
 
                 DrawType::Bitmap { binds }
             }
+
         }
     }
 }
@@ -279,6 +292,7 @@ pub enum DrawType {
     Color,
     Gradient { bind_group: wgpu::BindGroup },
     Bitmap { binds: BitmapBinds },
+
 }
 
 #[derive(Debug)]
@@ -424,6 +438,8 @@ impl BitmapBinds {
         Self { bind_group }
     }
 }
+
+
 
 fn create_texture_transforms(
     matrix: &[[f32; 3]; 3],

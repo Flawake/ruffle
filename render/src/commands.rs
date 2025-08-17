@@ -13,6 +13,16 @@ pub trait CommandHandler {
         smoothing: bool,
         pixel_snapping: PixelSnapping,
     );
+    fn render_bitmap_scale9grid(
+        &mut self,
+        bitmap: BitmapHandle,
+        transform: Transform,
+        smoothing: bool,
+        pixel_snapping: PixelSnapping,
+        scale9_rect: [f32; 4],
+        src_size: [f32; 2],
+        dst_size: [f32; 2],
+    );
     fn render_stage3d(&mut self, bitmap: BitmapHandle, transform: Transform);
     fn render_shape(&mut self, shape: ShapeHandle, transform: Transform);
     fn draw_rect(&mut self, color: Color, matrix: Matrix);
@@ -66,6 +76,23 @@ impl CommandList {
                     smoothing,
                     pixel_snapping,
                 } => handler.render_bitmap(bitmap, transform, smoothing, pixel_snapping),
+                Command::RenderBitmapScale9Grid {
+                    bitmap,
+                    transform,
+                    smoothing,
+                    pixel_snapping,
+                    scale9_rect,
+                    src_size,
+                    dst_size,
+                } => handler.render_bitmap_scale9grid(
+                    bitmap,
+                    transform,
+                    smoothing,
+                    pixel_snapping,
+                    scale9_rect,
+                    src_size,
+                    dst_size,
+                ),
                 Command::RenderShape { shape, transform } => handler.render_shape(shape, transform),
                 Command::RenderStage3D { bitmap, transform } => {
                     handler.render_stage3d(bitmap, transform)
@@ -102,6 +129,30 @@ impl CommandHandler for CommandList {
                 transform,
                 smoothing,
                 pixel_snapping,
+            });
+        }
+    }
+
+    #[inline]
+    fn render_bitmap_scale9grid(
+        &mut self,
+        bitmap: BitmapHandle,
+        transform: Transform,
+        smoothing: bool,
+        pixel_snapping: PixelSnapping,
+        scale9_rect: [f32; 4],
+        src_size: [f32; 2],
+        dst_size: [f32; 2],
+    ) {
+        if self.maskers_in_progress <= 1 {
+            self.commands.push(Command::RenderBitmapScale9Grid {
+                bitmap,
+                transform,
+                smoothing,
+                pixel_snapping,
+                scale9_rect,
+                src_size,
+                dst_size,
             });
         }
     }
@@ -190,6 +241,15 @@ pub enum Command {
         transform: Transform,
         smoothing: bool,
         pixel_snapping: PixelSnapping,
+    },
+    RenderBitmapScale9Grid {
+        bitmap: BitmapHandle,
+        transform: Transform,
+        smoothing: bool,
+        pixel_snapping: PixelSnapping,
+        scale9_rect: [f32; 4], // x_min, x_max, y_min, y_max in source texture space
+        src_size: [f32; 2],
+        dst_size: [f32; 2],
     },
     RenderStage3D {
         bitmap: BitmapHandle,

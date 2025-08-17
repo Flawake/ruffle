@@ -19,6 +19,8 @@ use ruffle_render::transform::Transform;
 use std::mem;
 use swf::{BlendMode, Color, ColorTransform, Twips};
 use wgpu::Backend;
+use wgpu::util::DeviceExt;
+use bytemuck;
 
 use super::target::PoolOrArcTexture;
 
@@ -82,6 +84,21 @@ impl<'pass, 'frame: 'pass, 'global: 'frame> CommandRenderer<'pass, 'frame, 'glob
                 *smoothing,
                 *blend_mode,
                 *render_stage3d,
+            ),
+            DrawCommand::RenderBitmapScale9Grid {
+                bitmap,
+                transform_buffer,
+                smoothing,
+                scale9_rect,
+                src_size,
+                dst_size,
+            } => self.render_bitmap_scale9grid(
+                bitmap,
+                *transform_buffer,
+                *smoothing,
+                *scale9_rect,
+                *src_size,
+                *dst_size,
             ),
             DrawCommand::RenderTexture {
                 _texture,
@@ -166,6 +183,8 @@ impl<'pass, 'frame: 'pass, 'global: 'frame> CommandRenderer<'pass, 'frame, 'glob
         self.render_pass.set_bind_group(2, bind_group, &[]);
     }
 
+
+
     pub fn draw(
         &mut self,
         vertices: wgpu::BufferSlice<'pass>,
@@ -246,6 +265,187 @@ impl<'pass, 'frame: 'pass, 'global: 'frame> CommandRenderer<'pass, 'frame, 'glob
         }
     }
 
+    pub fn render_bitmap_scale9grid(
+        &mut self,
+        bitmap: &'frame BitmapHandle,
+        transform_buffer: wgpu::DynamicOffset,
+        smoothing: bool,
+        scale9_rect: [f32; 4],
+        src_size: [f32; 2],
+        dst_size: [f32; 2],
+    ) {
+        println!("🎯 render_bitmap_scale9grid called!");
+        println!("   scale9_rect: {:?}", scale9_rect);
+        println!("   src_size: {:?}", src_size);
+        println!("   dst_size: {:?}", dst_size);
+        
+        if cfg!(feature = "render_debug_labels") {
+            self.render_pass
+                .push_debug_group(&format!("render_bitmap_scale9grid {:?}", bitmap.0));
+        }
+
+        // Create a 9-slice scaling mesh
+        let texture = as_texture(bitmap);
+        
+        // Calculate the 9-slice grid dimensions
+        let [x_min, x_max, y_min, y_max] = scale9_rect;
+        let src_width = src_size[0];
+        let src_height = src_size[1];
+        let dst_width = dst_size[0];
+        let dst_height = dst_size[1];
+        
+        println!("   Grid dimensions: x_min={}, x_max={}, y_min={}, y_max={}", x_min, x_max, y_min, y_max);
+        println!("   Source: {}x{}, Destination: {}x{}", src_width, src_height, dst_width, dst_height);
+        
+        // Create vertices for 9-slice grid (3x3 quads)
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        
+        // Define the 9 regions with proper source and destination coordinates
+        // Each region is defined as: (src_x1, src_y1, src_x2, src_y2, dst_x1, dst_y1, dst_x2, dst_y2)
+        // The key insight: corners don't scale, edges scale in one direction, center scales in both directions
+        
+        // Calculate the actual destination dimensions based on the transform
+        let actual_dst_width = dst_width;
+        let actual_dst_height = dst_height;
+        
+        // Calculate the preserved corner sizes (these don't scale)
+        let left_corner_width = x_min;
+        let right_corner_width = src_width - x_max;
+        let top_corner_height = y_min;
+        let bottom_corner_height = src_height - y_max;
+        
+        // Calculate the scaled middle region dimensions
+        let middle_width = actual_dst_width - left_corner_width - right_corner_width;
+        let middle_height = actual_dst_height - top_corner_height - bottom_corner_height;
+        
+        let regions = [
+            // Top-left corner (no scaling)
+            (0.0, 0.0, x_min, y_min, 0.0, 0.0, left_corner_width, top_corner_height),
+            // Top edge (horizontal scaling only)
+            (x_min, 0.0, x_max, y_min, left_corner_width, 0.0, left_corner_width + middle_width, top_corner_height),
+            // Top-right corner (no scaling)
+            (x_max, 0.0, src_width, y_min, left_corner_width + middle_width, 0.0, actual_dst_width, top_corner_height),
+            // Left edge (vertical scaling only)
+            (0.0, y_min, x_min, y_max, 0.0, top_corner_height, left_corner_width, top_corner_height + middle_height),
+            // Center (scales in both directions)
+            (x_min, y_min, x_max, y_max, left_corner_width, top_corner_height, left_corner_width + middle_width, top_corner_height + middle_height),
+            // Right edge (vertical scaling only)
+            (x_max, y_min, src_width, y_max, left_corner_width + middle_width, top_corner_height, actual_dst_width, top_corner_height + middle_height),
+            // Bottom-left corner (no scaling)
+            (0.0, y_max, x_min, src_height, 0.0, top_corner_height + middle_height, left_corner_width, actual_dst_height),
+            // Bottom edge (horizontal scaling only)
+            (x_min, y_max, x_max, src_height, left_corner_width, top_corner_height + middle_height, left_corner_width + middle_width, actual_dst_height),
+            // Bottom-right corner (no scaling)
+            (x_max, y_max, src_width, src_height, left_corner_width + middle_width, top_corner_height + middle_height, actual_dst_width, actual_dst_height),
+        ];
+        
+        let mut vertex_index = 0;
+        for (sx1, sy1, sx2, sy2, dx1, dy1, dx2, dy2) in regions.iter() {
+            println!("   Region: src=({:.1},{:.1}) to ({:.1},{:.1}), dst=({:.1},{:.1}) to ({:.1},{:.1})", 
+                sx1, sy1, sx2, sy2, dx1, dy1, dx2, dy2);
+            
+            // Add 4 vertices for this quad
+            // UV coordinates should be normalized texture coordinates (0.0 to 1.0)
+            vertices.extend_from_slice(&[
+                // Top-left
+                [*dx1, *dy1, *sx1 / 200.0, *sy1 / 200.0],  // Fixed: use actual source texture size
+                // Top-right  
+                [*dx2, *dy1, *sx2 / 200.0, *sy1 / 200.0],  // Fixed: use actual source texture size
+                // Bottom-right
+                [*dx2, *dy2, *sx2 / 200.0, *sy2 / 200.0],  // Fixed: use actual source texture size
+                // Bottom-left
+                [*dx1, *dy2, *sx1 / 200.0, *sy2 / 200.0],  // Fixed: use actual source texture size
+            ]);
+            
+            // Add 6 indices for this quad (2 triangles)
+            indices.extend_from_slice(&[
+                vertex_index, vertex_index + 1, vertex_index + 2,
+                vertex_index, vertex_index + 2, vertex_index + 3,
+            ]);
+            
+            vertex_index += 4;
+        }
+        
+        println!("   Generated {} vertices and {} indices", vertices.len(), indices.len());
+        
+        // Create vertex and index buffers
+        let vertex_buffer = self.descriptors.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Scale9Grid vertices"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        
+        let index_buffer = self.descriptors.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Scale9Grid indices"),
+            contents: bytemuck::cast_slice(&indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        
+        // Create bind group for the texture
+        let bind = texture.bind_group(
+            smoothing,
+            &self.descriptors.device,
+            &self.descriptors.bind_layouts.bitmap,
+            &self.descriptors.quad,
+            bitmap.clone(),
+            &self.descriptors.bitmap_samplers,
+        );
+        
+        // Create bind group for scale9grid parameters
+        let scale9_params = crate::mesh::Scale9Params {
+            scale9_rect,
+            src_size,
+            dst_size,
+        };
+        
+        println!("   Scale9Params: {:?}", scale9_params);
+        
+        let scale9_buffer = self.descriptors.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Scale9Grid params"),
+            contents: bytemuck::cast_slice(&[scale9_params]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        
+        let scale9_bind_group = self.descriptors.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Scale9Grid bind group"),
+            layout: &self.descriptors.bind_layouts.scale9grid,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: scale9_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        
+        println!("   Setting up render pass...");
+        
+        // Set up the render pass
+        if self.needs_stencil {
+            self.render_pass
+                .set_pipeline(self.pipelines.scale9grid.pipeline_for(self.mask_state));
+        } else {
+            self.render_pass
+                .set_pipeline(self.pipelines.scale9grid.stencilless_pipeline());
+        }
+        
+        // Set all bind groups
+        self.render_pass.set_bind_group(1, &self.dynamic_transforms.bind_group, &[transform_buffer]);
+        self.render_pass.set_bind_group(2, &bind.bind_group, &[]);
+        self.render_pass.set_bind_group(3, &scale9_bind_group, &[]);
+        
+        // Draw the 9-slice mesh
+        self.render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+        self.render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+        self.render_pass.draw_indexed(0..indices.len() as u32, 0, 0..1);
+        
+        println!("   Draw call completed!");
+        
+        if cfg!(feature = "render_debug_labels") {
+            self.render_pass.pop_debug_group();
+        }
+    }
+
     pub fn render_shape(
         &mut self,
         shape: &'frame ShapeHandle,
@@ -279,6 +479,7 @@ impl<'pass, 'frame: 'pass, 'global: 'frame> CommandRenderer<'pass, 'frame, 'glob
                 DrawType::Bitmap { binds, .. } => {
                     self.prep_bitmap(&binds.bind_group, TrivialBlend::Normal, false);
                 }
+
             }
             self.render_pass.set_bind_group(
                 1,
@@ -405,6 +606,14 @@ pub enum DrawCommand {
         smoothing: bool,
         blend_mode: TrivialBlend,
         render_stage3d: bool,
+    },
+    RenderBitmapScale9Grid {
+        bitmap: BitmapHandle,
+        transform_buffer: wgpu::DynamicOffset,
+        smoothing: bool,
+        scale9_rect: [f32; 4],
+        src_size: [f32; 2],
+        dst_size: [f32; 2],
     },
     RenderTexture {
         _texture: PoolOrArcTexture,
@@ -736,6 +945,38 @@ impl CommandHandler for WgpuCommandHandler<'_> {
             }
         });
     }
+
+    fn render_bitmap_scale9grid(
+        &mut self,
+        bitmap: BitmapHandle,
+        transform: Transform,
+        smoothing: bool,
+        pixel_snapping: PixelSnapping,
+        scale9_rect: [f32; 4],
+        src_size: [f32; 2],
+        dst_size: [f32; 2],
+    ) {
+        let mut matrix = transform.matrix;
+        {
+            let texture = as_texture(&bitmap);
+            pixel_snapping.apply(&mut matrix);
+            matrix *= Matrix::scale(
+                texture.texture.width() as f32,
+                texture.texture.height() as f32,
+            );
+        }
+        self.add_to_current(matrix, transform.color_transform, |transform_buffer| {
+            DrawCommand::RenderBitmapScale9Grid {
+                bitmap,
+                transform_buffer,
+                smoothing,
+                scale9_rect,
+                src_size,
+                dst_size,
+            }
+        });
+    }
+
     fn render_stage3d(&mut self, bitmap: BitmapHandle, transform: Transform) {
         let mut matrix = transform.matrix;
         {

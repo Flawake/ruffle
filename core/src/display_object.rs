@@ -757,11 +757,25 @@ impl<'gc> DisplayObjectBase<'gc> {
 
     fn recheck_cache_as_bitmap(&self) {
         let mut write = self.cell.borrow_mut();
-        let should_cache = self.is_bitmap_cached_preference() || !write.filters.is_empty();
+        let scale9grid = self.scaling_grid.get();
+        let should_cache = self.is_bitmap_cached_preference() 
+            || !write.filters.is_empty()
+            || (scale9grid.width() > Twips::ZERO && scale9grid.height() > Twips::ZERO);
+        
+        println!("🔍 recheck_cache_as_bitmap for object: {:?}", self.name());
+        println!("   cacheAsBitmap preference: {}", self.is_bitmap_cached_preference());
+        println!("   has filters: {}", !write.filters.is_empty());
+        println!("   scale9grid: {:?} (width: {}, height: {})", scale9grid, scale9grid.width(), scale9grid.height());
+        println!("   should_cache: {}", should_cache);
+        
         if should_cache && write.cache.is_none() {
+            println!("   ✅ Creating bitmap cache!");
             write.cache = Some(Default::default());
         } else if !should_cache && write.cache.is_some() {
+            println!("   ❌ Removing bitmap cache!");
             write.cache = None;
+        } else {
+            println!("   ⚠️  No change to cache state");
         }
     }
 
@@ -832,6 +846,7 @@ struct DrawCacheInfo {
 }
 
 pub fn render_base<'gc>(this: DisplayObject<'gc>, context: &mut RenderContext<'_, 'gc>) {
+    println!("🎬 render_base called for object: {:?}", this.name());
     if this.maskee().is_some() {
         return;
     }
@@ -844,6 +859,8 @@ pub fn render_base<'gc>(this: DisplayObject<'gc>, context: &mut RenderContext<'_
     };
 
     let cache_info = if context.use_bitmap_cache && this.is_bitmap_cached() {
+        println!("🎨 CacheAsBitmap is enabled for object: {:?}", this.name());
+        println!("   use_bitmap_cache: {}, is_bitmap_cached: {}", context.use_bitmap_cache, this.is_bitmap_cached());
         let mut cache_info: Option<DrawCacheInfo> = None;
         let base_transform = context.transform_stack.transform();
         let bounds: Rectangle<Twips> = this.render_bounds_with_transform(
@@ -970,20 +987,85 @@ pub fn render_base<'gc>(this: DisplayObject<'gc>, context: &mut RenderContext<'_
 
         // When rendering it back, ensure we're only keeping the translation - scale/rotation is within the image already
         apply_standard_mask_and_scroll(this, context, |context| {
-            context.commands.render_bitmap(
-                cache_info.handle,
-                Transform {
-                    matrix: Matrix {
-                        tx: context.transform_stack.transform().matrix.tx + offset_x,
-                        ty: context.transform_stack.transform().matrix.ty + offset_y,
-                        ..Default::default()
+            // Check if we should use 9-slice scaling
+            let scaling_grid = this.scaling_grid();
+            println!("🎯 About to check scale9grid for object: {:?}", this.name());
+            println!("   Current scaling_grid: {:?}", scaling_grid);
+            
+            // Only apply 9-slice scaling if this object has it AND no children have scale9grid
+            // This ensures only the innermost object with scale9grid applies it
+            let should_use_scale9 = scaling_grid.width() > Twips::ZERO 
+                && scaling_grid.height() > Twips::ZERO
+                && !this.has_child_with_scale9grid();
+            
+            println!("🔍 Scale9Grid check:");
+            println!("   scaling_grid: {:?}", scaling_grid);
+            println!("   width > 0: {}", scaling_grid.width() > Twips::ZERO);
+            println!("   height > 0: {}", scaling_grid.height() > Twips::ZERO);
+            println!("   has_child_with_scale9grid: {}", this.has_child_with_scale9grid());
+            println!("   should_use_scale9: {}", should_use_scale9);
+            
+            if should_use_scale9 {
+                // Use 9-slice scaling
+                let src_width = cache_info.bounds.width().to_pixels() as f32;
+                let src_height = cache_info.bounds.height().to_pixels() as f32;
+                let dst_width = (cache_info.bounds.width().to_pixels() as f32) * context.transform_stack.transform().matrix.a;
+                let dst_height = (cache_info.bounds.height().to_pixels() as f32) * context.transform_stack.transform().matrix.d;
+                
+                // The scaling_grid defines the CENTER region of the 9-slice grid
+                // Rectangle(x, y, width, height) where (x,y) is the top-left position relative to object center
+                let object_width = this.width() as f32;
+                let object_height = this.height() as f32;
+                
+                // Convert from object-local coordinates (centered) to bitmap coordinates (top-left)
+                // The Rectangle position is relative to object center, so we add object_width/2 and object_height/2
+                let center_x = scaling_grid.x_min.to_pixels() as f32 + object_width / 2.0;
+                let center_y = scaling_grid.y_min.to_pixels() as f32 + object_height / 2.0;
+                let center_width = scaling_grid.width().to_pixels() as f32;
+                let center_height = scaling_grid.height().to_pixels() as f32;
+                
+                // The scale9_rect defines the center region boundaries
+                let scale9_rect = [
+                    center_x.max(0.0),                    // x_min (left edge of center)
+                    (center_x + center_width).min(object_width), // x_max (right edge of center)
+                    center_y.max(0.0),                    // y_min (top edge of center)
+                    (center_y + center_height).min(object_height), // y_max (bottom edge of center)
+                ];
+                
+                context.commands.render_bitmap_scale9grid(
+                    cache_info.handle,
+                    Transform {
+                        matrix: Matrix {
+                            tx: context.transform_stack.transform().matrix.tx + offset_x,
+                            ty: context.transform_stack.transform().matrix.ty + offset_y,
+                            ..Default::default()
+                        },
+                        color_transform: cache_info.base_transform.color_transform,
+                        perspective_projection: cache_info.base_transform.perspective_projection,
                     },
-                    color_transform: cache_info.base_transform.color_transform,
-                    perspective_projection: cache_info.base_transform.perspective_projection,
-                },
-                true,
-                PixelSnapping::Always, // cacheAsBitmap forces pixel snapping
-            )
+                    true, // smoothing
+                    PixelSnapping::Always, // cacheAsBitmap forces pixel snapping
+                    scale9_rect,
+                    [src_width, src_height],
+                    [dst_width, dst_height],
+                );
+            } else {
+                // Use normal bitmap rendering
+                context.commands.render_bitmap(
+                    cache_info.handle,
+                    Transform {
+                        matrix: Matrix {
+                            tx: context.transform_stack.transform().matrix.tx + offset_x,
+                            ty: context.transform_stack.transform().matrix.ty + offset_y,
+                            ..Default::default()
+                        },
+                        color_transform: cache_info.base_transform.color_transform,
+                        perspective_projection: cache_info.base_transform.perspective_projection,
+                    },
+                    true,
+                    PixelSnapping::Always, // cacheAsBitmap forces pixel snapping
+                );
+            }
         });
     } else {
         if let Some(background) = this.opaque_background() {
@@ -1802,7 +1884,35 @@ pub trait TDisplayObject<'gc>:
 
     #[no_dynamic]
     fn set_scaling_grid(self, rect: Rectangle<Twips>) {
+        println!("🎯 set_scaling_grid called for object: {:?} with rect: {:?}", self.name(), rect);
         self.base().scaling_grid.set(rect);
+        // After setting the scaling_grid, we need to recheck if we should cache as bitmap
+        self.base().recheck_cache_as_bitmap();
+    }
+
+    /// Returns true if any child of this display object has a scale9grid set.
+    /// This is used to determine if 9-slice scaling should be applied to the parent
+    /// when cacheAsBitmap is enabled.
+    #[no_dynamic]
+    fn has_child_with_scale9grid(self) -> bool {
+        println!("   🔍 Checking children for scale9grid...");
+        if let Some(container) = self.as_container() {
+            for child in container.iter_render_list() {
+                let child_grid = child.scaling_grid();
+                println!("     Child: {:?}, scale9grid: {:?}", child.name(), child_grid);
+                if child_grid.width() > Twips::ZERO && child_grid.height() > Twips::ZERO {
+                    println!("     ✅ Found child with scale9grid!");
+                    return true;
+                }
+                // Recursively check children
+                if child.has_child_with_scale9grid() {
+                    println!("     ✅ Found descendant with scale9grid!");
+                    return true;
+                }
+            }
+        }
+        println!("     ❌ No children with scale9grid found");
+        false
     }
 
     #[no_dynamic]
@@ -1896,7 +2006,6 @@ pub trait TDisplayObject<'gc>:
     #[no_dynamic]
     fn set_blend_shader(self, value: Option<PixelBenderShaderHandle>) {
         self.base().set_blend_shader(value);
-        self.set_blend_mode(ExtendedBlendMode::Shader);
     }
 
     #[no_dynamic]

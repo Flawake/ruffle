@@ -7,6 +7,7 @@ pub struct BindLayouts {
     pub transforms: wgpu::BindGroupLayout,
     pub bitmap: wgpu::BindGroupLayout,
     pub gradient: wgpu::BindGroupLayout,
+    pub scale9grid: wgpu::BindGroupLayout,
     pub blend: wgpu::BindGroupLayout,
 }
 
@@ -161,11 +162,31 @@ impl BindLayouts {
             label: gradient_bind_layout_label.as_deref(),
         });
 
+        let scale9grid_bind_layout_label = create_debug_label!("Scale9Grid shape bind group");
+        let scale9grid = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(
+                            std::mem::size_of::<crate::mesh::Scale9Params>() as u64,
+                        ),
+                    },
+                    count: None,
+                },
+            ],
+            label: scale9grid_bind_layout_label.as_deref(),
+        });
+
         Self {
             globals,
             transforms,
             bitmap,
             gradient,
+            scale9grid,
             blend,
         }
     }

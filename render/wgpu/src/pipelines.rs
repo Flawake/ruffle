@@ -45,6 +45,7 @@ pub struct Pipelines {
     pub bitmap_opaque_dummy_stencil: wgpu::RenderPipeline,
     pub bitmap: EnumMap<TrivialBlend, ShapePipeline>,
     pub gradients: ShapePipeline,
+    pub scale9grid: ShapePipeline,
     pub complex_blends: EnumMap<ComplexBlend, ShapePipeline>,
 }
 
@@ -130,6 +131,33 @@ impl Pipelines {
             &[],
             PrimitiveTopology::TriangleList,
         );
+
+        // Create a custom pipeline layout for scale9grid that matches the shader bindings exactly
+        let scale9grid_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Scale9Grid pipeline layout"),
+            bind_group_layouts: &[
+                &bind_layouts.globals,           // Group 0: globals
+                &bind_layouts.transforms,        // Group 1: transforms (VERTEX + FRAGMENT)
+                &bind_layouts.bitmap,            // Group 2: texture/sampler (FRAGMENT)
+                &bind_layouts.scale9grid,        // Group 3: Scale9Params (FRAGMENT)
+            ],
+            push_constant_ranges: &[],
+        });
+
+        let scale9grid_pipeline = create_shape_pipeline_with_layout(
+            "Scale9Grid",
+            device,
+            format,
+            &shaders.scale9grid_shader,
+            msaa_sample_count,
+            &VERTEX_BUFFERS_DESCRIPTION_POS,
+            &scale9grid_pipeline_layout,
+            BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+            &[],
+            PrimitiveTopology::TriangleList,
+        );
+
+        // Pipeline already created above
 
         let complex_blend_bindings = vec![
             &bind_layouts.globals,
@@ -237,6 +265,7 @@ impl Pipelines {
             bitmap_opaque,
             bitmap_opaque_dummy_stencil: bitmap_opaque_dummy_depth,
             gradients: gradient_pipeline,
+            scale9grid: scale9grid_pipeline,
             complex_blends: complex_blend_pipelines,
         }
     }
@@ -312,13 +341,28 @@ fn create_shape_pipeline(
         bind_group_layouts,
         push_constant_ranges,
     });
+    create_shape_pipeline_with_layout(name, device, format, shader, msaa_sample_count, vertex_buffers_layout, &pipeline_layout, blend, push_constant_ranges, primitive_topology)
+}
 
+#[expect(clippy::too_many_arguments)]
+fn create_shape_pipeline_with_layout(
+    name: &str,
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    shader: &wgpu::ShaderModule,
+    msaa_sample_count: u32,
+    vertex_buffers_layout: &[wgpu::VertexBufferLayout<'_>],
+    pipeline_layout: &wgpu::PipelineLayout,
+    blend: BlendState,
+    _push_constant_ranges: &[wgpu::PushConstantRange],
+    primitive_topology: PrimitiveTopology,
+) -> ShapePipeline {
     let mask_render_state = |mask_name, stencil_state, write_mask| {
         device.create_render_pipeline(&create_pipeline_descriptor(
             create_debug_label!("{} pipeline {}", name, mask_name).as_deref(),
             shader,
             shader,
-            &pipeline_layout,
+            pipeline_layout,
             Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Stencil8,
                 depth_write_enabled: false,
@@ -348,7 +392,7 @@ fn create_shape_pipeline(
             create_debug_label!("{} stencilless pipeline", name).as_deref(),
             shader,
             shader,
-            &pipeline_layout,
+            pipeline_layout,
             None,
             &[Some(wgpu::ColorTargetState {
                 format,
