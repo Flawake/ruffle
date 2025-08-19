@@ -25,7 +25,7 @@ use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::Arc;
-use swf::{ColorTransform, Fixed8};
+use swf::{Color, ColorTransform, Fixed8};
 
 mod avm1_button;
 mod avm2_button;
@@ -975,12 +975,12 @@ pub fn render_base<'gc>(this: DisplayObject<'gc>, context: &mut RenderContext<'_
         // When rendering it back, ensure we're only keeping the translation - scale/rotation is within the image already
         apply_standard_mask_and_scroll(this, context, |context| {
             // Check if we should use 9-slice scaling
-            let scaling_grid = this.scaling_grid();
+            let scaling_rect = this.scaling_grid();
             
             // Only apply 9-slice scaling if this object has it AND no children have scale9grid
             // This ensures only the innermost object with scale9grid applies it
-            let should_use_scale9 = scaling_grid.width() > Twips::ZERO 
-                && scaling_grid.height() > Twips::ZERO
+            let should_use_scale9 = scaling_rect.width() > Twips::ZERO 
+                && scaling_rect.height() > Twips::ZERO
                 && !this.has_child_with_scale9grid();
             
             // Check if there's any rotation applied to the transform
@@ -991,39 +991,73 @@ pub fn render_base<'gc>(this: DisplayObject<'gc>, context: &mut RenderContext<'_
             let should_use_scale9 = should_use_scale9 && !has_rotation;
             
             if should_use_scale9 {
-                let src_width = cache_info.bounds.width().to_pixels() as f32;
-                let src_height = cache_info.bounds.height().to_pixels() as f32;
-                let dst_width = (cache_info.bounds.width().to_pixels() as f32) * context.transform_stack.transform().matrix.a;
-                let dst_height = (cache_info.bounds.height().to_pixels() as f32) * context.transform_stack.transform().matrix.d;
-                
-                // The scaling_grid defines the CENTER region of the 9-slice grid
-                // Rectangle(x, y, width, height) where (x,y) is the top-left position relative to object center
-                let object_width = this.width() as f32;
-                let object_height = this.height() as f32;
-                
-                // Convert from object-local coordinates (centered) to bitmap coordinates (top-left)
-                // The Rectangle position is relative to object center, so we add object_width/2 and object_height/2
-                let center_x = scaling_grid.x_min.to_pixels() as f32 + object_width / 2.0;
-                let center_y = scaling_grid.y_min.to_pixels() as f32 + object_height / 2.0;
-                let center_width = scaling_grid.width().to_pixels() as f32;
-                let center_height = scaling_grid.height().to_pixels() as f32;
-                
-                // The scale9_rect defines the center region boundaries
+                // Use the proven scaling calculation approach
+                let scaling_rect = this.scaling_grid();
+                debug_assert!(scaling_rect.is_valid());
+
+                let bounds = this.bounds_with_transform(&Default::default());
+
+                let local_matrix = this.base().transform().matrix;
+                let scale_x = f32::sqrt(local_matrix.a * local_matrix.a + local_matrix.b * local_matrix.b);
+                let scale_y = f32::sqrt(local_matrix.c * local_matrix.c + local_matrix.d * local_matrix.d);
+
+                let scaled_rect = Rectangle {
+                    x_min: Twips::new((bounds.x_min.get() as f32 * scale_x) as i32),
+                    y_min: Twips::new((bounds.y_min.get() as f32 * scale_y) as i32),
+                    x_max: Twips::new((bounds.x_max.get() as f32 * scale_x) as i32),
+                    y_max: Twips::new((bounds.y_max.get() as f32 * scale_y) as i32),
+                };
+                let scaled_width = scaled_rect.width();
+                let scaled_height = scaled_rect.height();
+
+                let left_width = scaling_rect.x_min - bounds.x_min;
+                let right_width = bounds.x_max - scaling_rect.x_max;
+                let top_height = scaling_rect.y_min - bounds.y_min;
+                let bottom_height = bounds.y_max - scaling_rect.y_max;
+
+                let inner_width = scaled_width - left_width - right_width;
+                let inner_height = scaled_height - top_height - bottom_height;
+                let inner_scale_x = inner_width.get() as f32 / scaling_rect.width().get() as f32;
+                let inner_scale_y = inner_height.get() as f32 / scaling_rect.height().get() as f32;
+
+                // Convert the proven calculation results to shader parameters
                 let scale9_rect = [
-                    center_x.max(0.0),                    // x_min (left edge of center)
-                    (center_x + center_width).min(object_width), // x_max (right edge of center)
-                    center_y.max(0.0),                    // y_min (top edge of center)
-                    (center_y + center_height).min(object_height), // y_max (bottom edge of center)
+                    (scaling_rect.x_min - bounds.x_min).to_pixels() as f32,  // x_min (relative to bounds)
+                    (scaling_rect.x_max - bounds.x_min).to_pixels() as f32,  // x_max (relative to bounds)
+                    (scaling_rect.y_min - bounds.y_min).to_pixels() as f32,  // y_min (relative to bounds)
+                    (scaling_rect.y_max - bounds.y_min).to_pixels() as f32,  // y_max (relative to bounds)
                 ];
                 
-                // Create a bitmap handle with Scale9Grid parameters
+                let src_size = [
+                    bounds.width().to_pixels() as f32,
+                    bounds.height().to_pixels() as f32,
+                ];
+                
+                let dst_size = [
+                    scaled_width.to_pixels() as f32,
+                    scaled_height.to_pixels() as f32,
+                ];
+
+                // Debug output to check the values
+                println!("🔍 Scale9Grid Debug:");
+                println!("  scaling_rect: {:?}", scaling_rect);
+                println!("  bounds: {:?}", bounds);
+                println!("  scale9_rect: {:?}", scale9_rect);
+                println!("  src_size: {:?}", src_size);
+                println!("  dst_size: {:?}", dst_size);
+                println!("  left_width: {:?}, right_width: {:?}", left_width, right_width);
+                println!("  top_height: {:?}, bottom_height: {:?}", top_height, bottom_height);
+                println!("  inner_scale_x: {:?}, inner_scale_y: {:?}", inner_scale_x, inner_scale_y);
+
+                // Create a bitmap handle with Scale9Grid parameters and pass to shader
                 let scale9grid_handle = BitmapHandle::with_scale9_grid(
                     cache_info.handle.0.clone(),
                     Some(scale9_rect),
-                    Some([src_width, src_height]),
-                    Some([dst_width, dst_height]),
+                    Some(src_size),
+                    Some(dst_size),
                 );
-                
+
+                // Render using the shader with the calculated parameters
                 context.commands.render_bitmap(
                     scale9grid_handle,
                     Transform {
@@ -1036,10 +1070,10 @@ pub fn render_base<'gc>(this: DisplayObject<'gc>, context: &mut RenderContext<'_
                         perspective_projection: cache_info.base_transform.perspective_projection,
                     },
                     true, // smoothing
-                    PixelSnapping::Always, // cacheAsBitmap forces pixel snapping
+                    PixelSnapping::Always,
                 );
             } else {
-                // Use normal bitmap rendering
+                // Use normal bitmap rendering with the cached bitmap
                 context.commands.render_bitmap(
                     cache_info.handle,
                     Transform {
